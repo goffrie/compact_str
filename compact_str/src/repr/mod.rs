@@ -1,5 +1,6 @@
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
+use core::mem::MaybeUninit;
 use core::str::Utf8Error;
 use core::{
     mem,
@@ -22,38 +23,23 @@ mod traits;
 
 use alloc::string::String;
 
-use capacity::Capacity;
-use heap::HeapBuffer;
-use inline::InlineBuffer;
-use last_utf8_char::LastUtf8Char;
-use static_str::StaticStr;
+use self::capacity::Capacity;
+use self::heap::{HeapBuffer, ThinHeapBuffer};
+use self::inline::InlineBuffer;
+use self::last_utf8_char::LastUtf8Char;
 pub use traits::IntoRepr;
 
 /// The max size of a string we can fit inline
 pub const MAX_SIZE: usize = core::mem::size_of::<String>();
-/// Used as a discriminant to identify different variants
-pub const HEAP_MASK: u8 = LastUtf8Char::Heap as u8;
-/// Used for `StaticStr` variant
-pub const STATIC_STR_MASK: u8 = LastUtf8Char::Static as u8;
-/// When our string is stored inline, we represent the length of the string in the last byte, offset
-/// by `LENGTH_MASK`
-pub const LENGTH_MASK: u8 = 0b11000000;
 
 const EMPTY: Repr = Repr::new_inline("");
 
-#[repr(C)]
-pub struct Repr(
-    // We have a pointer in the repesentation to properly carry provenance
-    *const (),
-    // Then we need two `usize`s (aka WORDs) of data, for the first we just define a `usize`...
-    usize,
-    // ...but the second we breakup into multiple pieces...
-    #[cfg(target_pointer_width = "64")] u32,
-    u16,
-    u8,
-    // ...so that the last byte can be a NonMax, which allows the compiler to see a niche value
-    LastUtf8Char,
-);
+pub enum Repr {
+    Inline(InlineBuffer),
+    Heap(HeapBuffer),
+    ThinHeap(ThinHeapBuffer),
+    Static(&'static str),
+}
 static_assertions::assert_eq_size!([u8; MAX_SIZE], Repr);
 
 unsafe impl Send for Repr {}
@@ -62,17 +48,12 @@ unsafe impl Sync for Repr {}
 impl Repr {
     #[inline]
     pub fn new(text: &str) -> Self {
-        let len = text.len();
-
-        if len == 0 {
-            EMPTY
-        } else if len <= MAX_SIZE {
-            // SAFETY: We checked that the length of text is less than or equal to MAX_SIZE
-            let inline = unsafe { InlineBuffer::new(text) };
-            Repr::from_inline(inline)
+        if let Some(inline) = InlineBuffer::new(text) {
+            Repr::Inline(inline)
+        } else if let Ok(heap) = HeapBuffer::new(text) {
+            Repr::Heap(heap)
         } else {
-            let heap = HeapBuffer::new(text);
-            Repr::from_heap(heap)
+            Repr::ThinHeap(ThinHeapBuffer::new(text))
         }
     }
 
@@ -82,7 +63,7 @@ impl Repr {
 
         if len <= MAX_SIZE {
             let inline = InlineBuffer::new_const(text);
-            Repr::from_inline(inline)
+            Repr::Inline(inline)
         } else {
             panic!("Inline string was too long, max length is `core::mem::size_of::<CompactString>()` bytes");
         }
@@ -90,9 +71,7 @@ impl Repr {
 
     #[inline]
     pub const fn from_static_str(text: &'static str) -> Self {
-        let repr = StaticStr::new(text);
-        // SAFETY: A `StaticStr` and `Repr` have the same size
-        unsafe { core::mem::transmute(repr) }
+        Repr::Static(text)
     }
 
     /// Create a [`Repr`] with the provided `capacity`
@@ -100,9 +79,10 @@ impl Repr {
     pub fn with_capacity(capacity: usize) -> Self {
         if capacity <= MAX_SIZE {
             EMPTY
+        } else if let Ok(heap) = HeapBuffer::with_capacity(capacity) {
+            Repr::Heap(heap)
         } else {
-            let heap = HeapBuffer::with_capacity(capacity);
-            Repr::from_heap(heap)
+            Repr::ThinHeap(ThinHeapBuffer::with_capacity(capacity))
         }
     }
 
@@ -145,7 +125,8 @@ impl Repr {
         // invariant is documented in the public API
         let slice = repr.as_mut_buf();
         // write the chunk into the Repr
-        slice[..bytes_len].copy_from_slice(bytes);
+        // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout
+        slice[..bytes_len].copy_from_slice(mem::transmute::<&[u8], &[MaybeUninit<u8>]>(bytes));
 
         // Set the length of the Repr
         // SAFETY: We just wrote the entire `buf` into the Repr
@@ -157,85 +138,31 @@ impl Repr {
     /// Create a [`Repr`] from a [`String`], in `O(1)` time. We'll attempt to inline the string
     /// if `should_inline` is `true`
     ///
-    /// Note: If the provided [`String`] is >16 MB and we're on a 32-bit arch, we'll copy the
+    /// Note: If the provided [`String`] has a capacity >16 MB and we're on a 32-bit arch, we'll copy the
     /// `String`.
     #[inline]
     pub fn from_string(s: String, should_inline: bool) -> Self {
-        let og_cap = s.capacity();
-        let cap = Capacity::new(og_cap);
-
-        #[cold]
-        fn capacity_on_heap(s: String) -> Repr {
-            let heap = HeapBuffer::new(s.as_str());
-            Repr::from_heap(heap)
+        if should_inline {
+            if let Some(inline) = InlineBuffer::new(&s) {
+                return Repr::Inline(inline);
+            }
         }
-
-        #[cold]
-        fn empty() -> Repr {
-            EMPTY
-        }
-
-        if cap.is_heap() {
-            // We only hit this case if the provided String is > 16MB and we're on a 32-bit arch. We
-            // expect it to be unlikely, thus we hint that to the compiler
-            capacity_on_heap(s)
-        } else if og_cap == 0 {
-            // We don't expect converting from an empty String often, so we make this code path cold
-            empty()
-        } else if should_inline && s.len() <= MAX_SIZE {
-            // SAFETY: Checked to make sure the string would fit inline
-            let inline = unsafe { InlineBuffer::new(s.as_str()) };
-            Repr::from_inline(inline)
-        } else {
-            let mut s = mem::ManuallyDrop::new(s.into_bytes());
-            let len = s.len();
-            let raw_ptr = s.as_mut_ptr();
-
-            let ptr = ptr::NonNull::new(raw_ptr).expect("string with capacity has null ptr?");
-            let heap = HeapBuffer { ptr, len, cap };
-
-            Repr::from_heap(heap)
+        match HeapBuffer::from_string(s) {
+            Ok(heap) => Repr::Heap(heap),
+            Err(s) => {
+                // This will copy the string.
+                Repr::ThinHeap(ThinHeapBuffer::new(&s))
+            }
         }
     }
 
     /// Converts a [`Repr`] into a [`String`], in `O(1)` time, if possible
     #[inline]
     pub fn into_string(self) -> String {
-        #[cold]
-        fn into_string_heap(this: HeapBuffer) -> String {
-            // SAFETY: We know pointer is valid for `length` bytes
-            let slice = unsafe { core::slice::from_raw_parts(this.ptr.as_ptr(), this.len) };
-            // SAFETY: A `Repr` contains valid UTF-8
-            let s = unsafe { core::str::from_utf8_unchecked(slice) };
-
-            String::from(s)
+        if let Repr::Heap(heap) = self {
+            return heap.into_string();
         }
-
-        if self.is_heap_allocated() {
-            // SAFTEY: we just checked that the discriminant indicates we're a HeapBuffer
-            let heap_buffer = unsafe { self.into_heap() };
-
-            if heap_buffer.cap.is_heap() {
-                // We don't expect capacity to be on the heap often, so we mark it as cold
-                into_string_heap(heap_buffer)
-            } else {
-                // Wrap the BoxString in a ManuallyDrop so the underlying buffer doesn't get freed
-                let this = mem::ManuallyDrop::new(heap_buffer);
-
-                // SAFETY: We checked above to make sure capacity is valid
-                let cap = unsafe { this.cap.as_usize() };
-
-                // SAFETY:
-                // * The memory in `ptr` was previously allocated by the same allocator the standard
-                //   library uses, with a required alignment of exactly 1.
-                // * `length` is less than or equal to capacity, due to internal invaraints.
-                // * `capacity` is correctly maintained internally.
-                // * `BoxString` only ever contains valid UTF-8.
-                unsafe { String::from_raw_parts(this.ptr.as_ptr(), this.len, cap) }
-            }
-        } else {
-            String::from(self.as_str())
-        }
+        self.as_str().into()
     }
 
     /// Reserves at least `additional` bytes. If there is already enough capacity to store
@@ -245,7 +172,7 @@ impl Repr {
         let len = self.len();
         let needed_capacity = len
             .checked_add(additional)
-            .expect("Attempted to reserve more than 'usize' bytes");
+            .expect("Attempted to reserve more than 'usize::MAX' bytes");
 
         if !self.is_static_str() && needed_capacity <= self.capacity() {
             // we already have enough space, no-op
@@ -259,25 +186,28 @@ impl Repr {
             // MAX_SIZE, if that `Repr` was created From a String or Box<str>
             //
             // SAFTEY: Our needed_capacity is >= our length, which is <= than MAX_SIZE
-            let inline = unsafe { InlineBuffer::new(self.as_str()) };
-            *self = Repr::from_inline(inline);
-        } else if !self.is_heap_allocated() {
-            // We're not heap allocated, but need to be, create a HeapBuffer
-            let heap = HeapBuffer::with_additional(self.as_str(), additional);
-            *self = Repr::from_heap(heap);
+            let inline = InlineBuffer::new(self.as_str()).expect("self.len() <= needed_capacity <= MAX_SIZE");
+            *self = Repr::Inline(inline);
         } else {
-            // We're already heap allocated, but we need more capacity
-            //
-            // SAFETY: We checked above to see if we're heap allocated
-            let heap_buffer = unsafe { self.as_mut_heap() };
-
-            // To reduce allocations, we amortize our growth
-            let amortized_capacity = heap::amortized_growth(len, additional);
-            // Attempt to grow our capacity, allocating a new HeapBuffer on failure
-            if heap_buffer.realloc(amortized_capacity).is_err() {
-                // Create a new HeapBuffer
-                let heap = HeapBuffer::with_additional(self.as_str(), additional);
-                *self = Repr::from_heap(heap);
+            match self {
+                Repr::Inline(_) | Repr::Static(_) => {
+                    // We're not heap allocated, but need to be create a HeapBuffer
+                    if let Ok(heap) = HeapBuffer::with_additional(self.as_str(), additional) {
+                        *self = Repr::Heap(heap);
+                    } else {
+                        *self = Repr::ThinHeap(ThinHeapBuffer::with_additional(self.as_str(), additional));
+                    }
+                }
+                Repr::Heap(heap) => {
+                    let amortized_capacity = heap::amortized_growth(len, additional);
+                    if let Err(TooLong) = heap.realloc(amortized_capacity) {
+                        *self = Repr::ThinHeap(ThinHeapBuffer::with_additional(self.as_str(), additional));
+                    }
+                }
+                Repr::ThinHeap(thin_heap) => {
+                    let amortized_capacity = heap::amortized_growth(len, additional);
+                    thin_heap.realloc(amortized_capacity)
+                }
             }
         }
     }
@@ -286,31 +216,26 @@ impl Repr {
         // Note: We can't shrink the inline variant since it's buffer is a fixed size
         // or the static str variant since it is just a pointer, so we only
         // take action here if our string is heap allocated
-        if self.is_heap_allocated() {
-            // SAFETY: We just checked the discriminant to make sure we're heap allocated
-            let heap = unsafe { self.as_mut_heap() };
-
-            let old_capacity = heap.capacity();
-            let new_capacity = heap.len.max(min_capacity);
-
-            if new_capacity <= MAX_SIZE {
-                // String can be inlined.
-                let mut inline = InlineBuffer::empty();
-                // SAFETY: Our src is on the heap, so it does not overlap with our new inline
-                // buffer, and the src is a `Repr` so we can assume it's valid UTF-8
-                unsafe {
-                    inline
-                        .0
-                        .as_mut_ptr()
-                        .copy_from_nonoverlapping(heap.ptr.as_ptr(), heap.len)
-                };
-                // SAFETY: The src we wrote from was a `Repr` which we can assume is valid UTF-8
-                unsafe { inline.set_len(heap.len) }
-                *self = Repr::from_inline(inline);
-            } else if new_capacity < old_capacity {
-                // String can be shrunk.
-                // We can ignore the result. The string keeps its old capacity, but that's okay.
-                let _ = heap.realloc(new_capacity);
+        if let Repr::Inline(_) | Repr::Static(_) = self {
+            return
+        }
+        let new_capacity = self.len().max(min_capacity);
+        if new_capacity >= self.capacity() {
+            return;
+        }
+        if new_capacity <= MAX_SIZE {
+            // String can be inlined.
+            let inline = InlineBuffer::new(self.as_str()).expect("self.len() <= new_capacity <= MAX_SIZE");
+            *self = Repr::Inline(inline);
+            return;
+        }
+        match self {
+            Repr::Inline(_) | Repr::Static(_) => (),
+            Repr::Heap(heap) => {
+                heap.realloc(new_capacity).ok().expect("shrinking cannot fail");
+            }
+            Repr::ThinHeap(thin_heap) => {
+                thin_heap.realloc(new_capacity);
             }
         }
     }
@@ -336,7 +261,8 @@ impl Repr {
         debug_assert_eq!(push_buffer.len(), s.as_bytes().len());
 
         // Copy the string into our buffer
-        push_buffer.copy_from_slice(s.as_bytes());
+        // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout
+        push_buffer.copy_from_slice(unsafe { mem::transmute::<&[u8], &[MaybeUninit<u8>]>(s.as_bytes()) });
 
         // Increment the length of our string
         //
@@ -490,32 +416,23 @@ impl Repr {
         }
     }
 
-    /// Return a mutable reference to the entirely underlying buffer
+    /// Return a mutable reference to the entire underlying buffer, including spare capacity
     ///
     /// # Safety
+    /// * Callers can only assume that the first `self.len()` bytes of the returned buffer are initialized
+    /// * Callers must only write initialized bytes into the buffer
     /// * Callers must guarantee that any modifications made to the buffer are valid UTF-8
-    pub unsafe fn as_mut_buf(&mut self) -> &mut [u8] {
+    pub unsafe fn as_mut_buf(&mut self) -> &mut [MaybeUninit<u8>] {
         if let Some(s) = self.as_static_str() {
             *self = Repr::new(s);
         }
 
-        // the last byte stores our discriminant and stack length
-        let last_byte = self.last_byte();
-
-        let (ptr, cap) = if last_byte == HEAP_MASK {
-            // SAFETY: We just checked the discriminant to make sure we're heap allocated
-            let heap_buffer = self.as_heap();
-            let ptr = heap_buffer.ptr.as_ptr();
-            let cap = heap_buffer.capacity();
-
-            (ptr, cap)
-        } else {
-            let ptr = self as *mut Self as *mut u8;
-            (ptr, MAX_SIZE)
-        };
-
-        // SAFETY: Our data is valid for `cap` bytes, and is initialized
-        core::slice::from_raw_parts_mut(ptr, cap)
+        match self {
+            Repr::Static(_) => unreachable!(),
+            Repr::Inline(inline) => inline.as_mut_buf(),
+            Repr::Heap(heap) => heap.as_mut_buf(),
+            Repr::ThinHeap(thin_heap) => thin_heap.as_mut_buf(),
+        }
     }
 
     /// Sets the length of the string that our underlying buffer contains

@@ -1,14 +1,12 @@
-use core::{
-    cmp,
-    mem,
-    ptr,
-};
+use core::mem::MaybeUninit;
+use core::num::NonZeroUsize;
+use core::{cmp, mem, ptr, slice};
+
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use super::capacity::Capacity;
-use super::{
-    Repr,
-    MAX_SIZE,
-};
+use super::{Repr, MAX_SIZE};
 
 /// The minimum size we'll allocate on the heap is one usize larger than our max inline size
 const MIN_HEAP_SIZE: usize = MAX_SIZE + mem::size_of::<usize>();
@@ -27,38 +25,74 @@ pub fn amortized_growth(cur_len: usize, additional: usize) -> usize {
     amortized.max(required)
 }
 
-#[repr(C)]
-pub struct HeapBuffer {
-    pub ptr: ptr::NonNull<u8>,
-    pub len: usize,
-    pub cap: Capacity,
+pub struct Cap([u8; mem::size_of::<usize>() - 1]);
+
+pub struct TooLong;
+
+impl Cap {
+    #[inline]
+    fn new(l: usize) -> Result<Self, TooLong> {
+        if l < (1 << (mem::size_of::<usize>() - 1)) {
+            Ok(Cap(l.to_le_bytes()[..mem::size_of::<usize>() - 1]
+                .try_into()
+                .unwrap()))
+        } else {
+            Err(TooLong)
+        }
+    }
 }
-static_assertions::assert_eq_size!(HeapBuffer, Repr);
+
+impl From<Cap> for usize {
+    #[inline]
+    fn from(value: Cap) -> Self {
+        let mut buf = [0; mem::size_of::<usize>()];
+        buf[..mem::size_of::<usize>() - 1].copy_from_slice(&value.0);
+        usize::from_le_bytes(buf)
+    }
+}
+
+#[repr(C, packed)]
+pub struct HeapBuffer {
+    // Invariant:
+    // `ptr` points to a heap-allocated buffer of length `cap` and alignment 1,
+    // and its first `len` bytes are initialized with valid UTF-8;
+    // i.e. these fields correspond to those of a `String`
+    ptr: ptr::NonNull<u8>,
+    len: usize,
+    cap: Cap,
+}
+#[repr(C, packed)]
+pub struct ThinHeapBuffer {
+    ptr: ptr::NonNull<u8>,
+    len: usize,
+}
 
 impl HeapBuffer {
-    /// Create a [`HeapBuffer`] with the provided text
+    /// Create a [`HeapBuffer`] with the provided text. Returns `Err` if the text is too long.
     #[inline]
-    pub fn new(text: &str) -> Self {
-        let len = text.len();
-        let (cap, ptr) = allocate_ptr(len);
-
-        // copy our string into the buffer we just allocated
-        //
-        // SAFETY: We know both `src` and `dest` are valid for respectively reads and writes of
-        // length `len` because `len` comes from `src`, and `dest` was allocated to be at least that
-        // length. We also know they're non-overlapping because `dest` is newly allocated
-        unsafe { ptr.as_ptr().copy_from_nonoverlapping(text.as_ptr(), len) };
-
-        HeapBuffer { ptr, len, cap }
+    pub fn new(text: &str) -> Result<Self, TooLong> {
+        let capacity = text.len().max(MIN_HEAP_SIZE);
+        let cap = Cap::new(capacity)?;
+        let mut allocated = Vec::with_capacity(capacity);
+        allocated.extend_from_slice(text.as_bytes()); // this cannot reallocate because `capacity` >= `text.len()`
+        let ptr = ptr::NonNull::new(allocated.as_mut_ptr()).unwrap();
+        let len = allocated.len();
+        mem::forget(allocated);
+        // SAFETY: `ptr` comes from an Vec allocated with capacity `` == `cap`,
+        // and its content comes from a `&str`
+        Ok(HeapBuffer { ptr, len, cap })
     }
 
     /// Create an empty [`HeapBuffer`] with a specific capacity
     #[inline]
-    pub fn with_capacity(capacity: usize) -> Self {
-        let len = 0;
-        let (cap, ptr) = allocate_ptr(capacity);
-
-        HeapBuffer { ptr, len, cap }
+    pub fn with_capacity(capacity: usize) -> Result<Self, TooLong> {
+        let capacity = capacity.max(MIN_HEAP_SIZE);
+        let cap = Cap::new(capacity)?;
+        let mut allocated = Vec::with_capacity(capacity);
+        let ptr = ptr::NonNull::new(allocated.as_mut_ptr()).unwrap();
+        mem::forget(allocated);
+        // SAFETY: `ptr` comes from an Vec allocated with capacity `capacity` == `cap`
+        Ok(HeapBuffer { ptr, len: 0, cap })
     }
 
     /// Create a [`HeapBuffer`] with `text` that has _at least_ `additional` bytes of capacity
@@ -66,169 +100,104 @@ impl HeapBuffer {
     /// To prevent frequent re-allocations, this method will create a [`HeapBuffer`] with a capacity
     /// of `text.len() + additional` or `text.len() * 1.5`, whichever is greater
     #[inline]
-    pub fn with_additional(text: &str, additional: usize) -> Self {
+    pub fn with_additional(text: &str, additional: usize) -> Result<Self, TooLong> {
+        let new_capacity = amortized_growth(text.len(), additional).max(MIN_HEAP_SIZE);
+        let new_cap = Cap::new(new_capacity)?;
+        let mut allocated = Vec::with_capacity(new_capacity);
+        allocated.extend_from_slice(text.as_bytes()); // this cannot reallocate because `capacity` >= `text.len()`
+        let ptr = ptr::NonNull::new(allocated.as_mut_ptr()).unwrap();
+        let len = allocated.len();
+        mem::forget(allocated);
+        // SAFETY: `ptr` comes from an Vec allocated with capacity `new_capacity` == `new_cap`
+        // and its content comes from a `&str`
+        Ok(HeapBuffer {
+            ptr,
+            len,
+            cap: new_cap,
+        })
+    }
+
+    /// Create a [`HeapBuffer`] with the provided `String`, reusing its allocation. Returns `Err` if its capacity
+    /// is too large for this representation.
+    #[inline]
+    pub fn from_string(mut text: String) -> Result<Self, String> {
+        let cap = match Cap::new(text.capacity()) {
+            Ok(c) => c,
+            Err(TooLong) => return Err(text),
+        };
         let len = text.len();
-        let new_capacity = amortized_growth(len, additional);
-        let (cap, ptr) = allocate_ptr(new_capacity);
-
-        // copy our string into the buffer we just allocated
-        //
-        // SAFETY: We know both `src` and `dest` are valid for respectively reads and writes of
-        // length `len` because `len` comes from `src`, and `dest` was allocated to be at least that
-        // length. We also know they're non-overlapping because `dest` is newly allocated
-        unsafe { ptr.as_ptr().copy_from_nonoverlapping(text.as_ptr(), len) };
-
-        HeapBuffer { ptr, len, cap }
+        let ptr = ptr::NonNull::new(text.as_mut_ptr()).unwrap();
+        mem::forget(text);
+        // SAFETY: `ptr` comes from an String allocated with capacity `cap`,
+        Ok(HeapBuffer { ptr, len, cap })
     }
 
     /// Return the capacity of the [`HeapBuffer`]
     #[inline]
     pub fn capacity(&self) -> usize {
-        #[cold]
-        fn read_capacity_from_heap(this: &HeapBuffer) -> usize {
-            // re-adjust the pointer to include the capacity that's on the heap
-            let adj_ptr: *const u8 = this.ptr.as_ptr().wrapping_sub(mem::size_of::<usize>());
-            let mut buf = [0u8; mem::size_of::<usize>()];
-            // SAFETY: `src` and `dst` don't overlap, and are valid for usize number of bytes
-            unsafe {
-                ptr::copy_nonoverlapping(adj_ptr, buf.as_mut_ptr(), mem::size_of::<usize>());
-            }
-            usize::from_ne_bytes(buf)
-        }
-
-        if self.cap.is_heap() {
-            read_capacity_from_heap(self)
-        } else {
-            // SAFETY: Checked above that the capacity is on the stack
-            unsafe { self.cap.as_usize() }
-        }
+        self.cap.into()
     }
 
-    /// Try to grow the [`HeapBuffer`] by reallocating, returning an error if we fail
-    pub fn realloc(&mut self, new_capacity: usize) -> Result<usize, ()> {
-        let new_cap = Capacity::new(new_capacity);
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Grow the [`HeapBuffer`].
+    /// Returns an error if the capacity is too long for this representation.
+    pub fn realloc(&mut self, new_capacity: usize) -> Result<usize, TooLong> {
+        // Always allocate at least MIN_HEAP_SIZE
+        let new_capacity = new_capacity.max(MIN_HEAP_SIZE);
+
+        let new_cap = Cap::new(new_capacity)?;
 
         // We can't reallocate to a size less than our length, or else we'd clip the string
-        if new_capacity < self.len {
-            return Err(());
-        }
+        assert!(new_capacity >= self.len);
 
-        // HeapBuffer doesn't support 0 byte heap sizes
-        if new_capacity == 0 {
-            return Err(());
-        }
-
-        // Always allocate at least MIN_HEAP_SIZE
-        let new_capacity = cmp::max(new_capacity, MIN_HEAP_SIZE);
-
-        let (new_cap, new_ptr) = match (self.cap.is_heap(), new_cap.is_heap()) {
-            // both current and new capacity can be stored inline
-            (false, false) => {
-                // SAFETY: checked above that our capacity is valid
-                let cap = unsafe { self.cap.as_usize() };
-
-                // current capacity is the same as the new, nothing to do!
-                if cap == new_capacity {
-                    return Ok(new_capacity);
-                }
-
-                let cur_layout = inline_capacity::layout(cap);
-                let new_layout = inline_capacity::layout(new_capacity);
-                let new_size = new_layout.size();
-
-                // It's possible `new_size` could overflow since inline_capacity::layout pads for
-                // alignment
-                if new_size < new_capacity {
-                    return Err(());
-                }
-
-                // SAFETY:
-                // * We're using the same allocator that we used for `ptr`
-                // * The layout is the same because we checked that the capacity is inline
-                // * `new_size` will be > 0, we return early if the requested capacity is 0
-                // * Checked above if `new_size` overflowed when rounding to alignment
-                match ptr::NonNull::new(unsafe {
-                    ::alloc::alloc::realloc(self.ptr.as_ptr(), cur_layout, new_size)
-                }) {
-                    Some(ptr) => (new_cap, ptr),
-                    None => return Err(()),
-                }
-            }
-            // both current and new capacity need to be stored on the heap
-            (true, true) => {
-                let cur_layout = heap_capacity::layout(self.capacity());
-                let new_layout = heap_capacity::layout(new_capacity);
-                let new_size = new_layout.size();
-
-                // alloc::realloc requires that size > 0
-                debug_assert!(new_size > 0);
-
-                // It's possible `new_size` could overflow since heap_capacity::layout requires a
-                // few additional bytes
-                if new_size < new_capacity {
-                    return Err(());
-                }
-
-                // move our pointer back one WORD since our capacity is behind it
-                let raw_ptr = self.ptr.as_ptr();
-                let adj_ptr = raw_ptr.wrapping_sub(mem::size_of::<usize>());
-
-                // SAFETY:
-                // * We're using the same allocator that we used for `ptr`
-                // * The layout is the same because we checked that the capacity is on the heap
-                // * `new_size` will be > 0, we return early if the requested capacity is 0
-                // * Checked above if `new_size` overflowed when rounding to alignment
-                let cap_ptr = unsafe { alloc::alloc::realloc(adj_ptr, cur_layout, new_size) };
-                // Check if reallocation succeeded
-                if cap_ptr.is_null() {
-                    return Err(());
-                }
-
-                // Our allocation succeeded! Write the new capacity
-                //
-                // SAFTEY:
-                // * `src` and `dst` are both valid for reads of `usize` number of bytes
-                // * `src` and `dst` don't overlap because we created `src`
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        new_capacity.to_ne_bytes().as_ptr(),
-                        cap_ptr,
-                        mem::size_of::<usize>(),
-                    )
-                };
-
-                // Finally, adjust our pointer backup so it points at the string content
-                let str_ptr = cap_ptr.wrapping_add(mem::size_of::<usize>());
-                // SAFETY: We checked above to make sure the pointer was non-null
-                let ptr = unsafe { ptr::NonNull::new_unchecked(str_ptr) };
-
-                (new_cap, ptr)
-            }
-            // capacity is currently inline or on the heap, but needs to move, can't realloc because
-            // we'd need to change the layout!
-            (false, true) | (true, false) => return Err(()),
+        let mut vec = unsafe {
+            // SAFETY: xxx
+            mem::ManuallyDrop::new(Vec::from_raw_parts(
+                self.ptr.as_ptr(),
+                self.len,
+                self.cap.into(),
+            ))
         };
 
-        // set our new pointer and new capacity
-        self.ptr = new_ptr;
-        self.cap = new_cap;
+        if new_capacity > vec.capacity() {
+            vec.reserve_exact(new_capacity - vec.capacity());
+        } else {
+            vec.shrink_to(new_capacity);
+        }
+        debug_assert_eq!(vec.capacity(), new_capacity);
 
+        self.ptr = ptr::NonNull::new(vec.as_mut_ptr()).unwrap();
+        self.cap = new_cap;
         Ok(new_capacity)
     }
 
     /// Set's the length of the content for this [`HeapBuffer`]
     ///
     /// # SAFETY:
+    /// * The caller must guarantee that `self.capacity()` is at least `len`
     /// * The caller must guarantee that `len` bytes in the buffer are valid UTF-8
     #[inline]
     pub unsafe fn set_len(&mut self, len: usize) {
         self.len = len;
     }
 
-    /// Deallocates the memory owned by the provided [`HeapBuffer`]
-    #[inline]
-    pub fn dealloc(&mut self) {
-        deallocate_ptr(self.ptr, self.cap);
+    pub(crate) fn into_string(self) -> String {
+        unsafe {
+            // SAFETY: see this type's invariant
+            let s = String::from_raw_parts(self.ptr.as_ptr(), self.len, self.cap.into());
+            mem::forget(self);
+            s
+        }
+    }
+
+    pub(crate) unsafe fn as_mut_buf(&mut self) -> &mut [MaybeUninit<u8>] {
+        // SAFETY: this type's invariant guarantees that self.ptr is allocated for at least self.len
+        // the caller must guarantee that they only write valid UTF-8
+        slice::from_raw_parts_mut(self.ptr.as_ptr().cast(), self.cap.into())
     }
 }
 
@@ -255,7 +224,14 @@ impl Clone for HeapBuffer {
 
 impl Drop for HeapBuffer {
     fn drop(&mut self) {
-        self.dealloc()
+        unsafe {
+            // SAFETY: see this type's invariant
+            drop(Vec::from_raw_parts(
+                self.ptr.as_ptr(),
+                self.len,
+                self.cap.into(),
+            ))
+        }
     }
 }
 
@@ -331,10 +307,7 @@ pub fn deallocate_ptr(ptr: ptr::NonNull<u8>, cap: Capacity) {
 }
 
 mod heap_capacity {
-    use core::{
-        alloc,
-        ptr,
-    };
+    use core::{alloc, ptr};
 
     use super::StrBuffer;
 
@@ -383,10 +356,7 @@ mod heap_capacity {
 }
 
 mod inline_capacity {
-    use core::{
-        alloc,
-        ptr,
-    };
+    use core::{alloc, ptr};
 
     use super::StrBuffer;
 
@@ -439,10 +409,7 @@ mod inline_capacity {
 mod test {
     use test_case::test_case;
 
-    use super::{
-        HeapBuffer,
-        MIN_HEAP_SIZE,
-    };
+    use super::{HeapBuffer, MIN_HEAP_SIZE};
 
     const EIGHTEEN_MB: usize = 18 * 1024 * 1024;
 

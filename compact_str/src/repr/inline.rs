@@ -1,45 +1,38 @@
-use core::ptr;
+use core::mem::MaybeUninit;
+use core::{ptr, slice};
 
-use super::{
-    Repr,
-    LENGTH_MASK,
-    MAX_SIZE,
-};
+use super::last_utf8_char::LastUtf8Char;
+use super::{Repr, LENGTH_MASK, MAX_SIZE};
 
 /// A buffer stored on the stack whose size is equal to the stack size of `String`
-#[repr(transparent)]
-pub struct InlineBuffer(pub [u8; MAX_SIZE]);
-static_assertions::assert_eq_size!(InlineBuffer, Repr);
+#[repr(C)]
+pub(crate) struct InlineBuffer {
+    buf: [u8; MAX_SIZE - 1],
+    last_char: LastUtf8Char
+}
 
 impl InlineBuffer {
     /// Construct a new [`InlineString`]. A string that lives in a small buffer on the stack
     ///
-    /// SAFETY:
-    /// * The caller must guarantee that the length of `text` is less than [`MAX_SIZE`]
+    /// Returns `None` if the length of `text` is greater than [`MAX_SIZE`].
     #[inline]
-    pub unsafe fn new(text: &str) -> Self {
-        debug_assert!(text.len() <= MAX_SIZE);
-
-        let len = text.len();
-        let mut buffer = [0u8; MAX_SIZE];
-
-        // set the length in the last byte
-        buffer[MAX_SIZE - 1] = len as u8 | LENGTH_MASK;
-
-        // copy the string into our buffer
-        //
-        // note: in the case where len == MAX_SIZE, we'll overwrite the len, but that's okay because
-        // when reading the length we can detect that the last byte is part of UTF-8 and return a
-        // length of MAX_SIZE
-        //
-        // SAFETY:
-        // * src (`text`) is valid for `len` bytes because `len` comes from `text`
-        // * dst (`buffer`) is valid for `len` bytes because we assert src is less than MAX_SIZE
-        // * src and dst don't overlap because we created dst
-        //
-        ptr::copy_nonoverlapping(text.as_ptr(), buffer.as_mut_ptr(), len);
-
-        InlineBuffer(buffer)
+    pub fn new(s: &str) -> Option<InlineBuffer> {
+        let mut short_buf = [0u8; MAX_SIZE - 1];
+        let last_char;
+        if s.len() == MAX_SIZE {
+            short_buf[..MAX_SIZE - 1].copy_from_slice(&s.as_bytes()[..MAX_SIZE - 1]);
+            last_char = LastUtf8Char::from_utf8_byte(s.as_bytes()[MAX_SIZE - 1]);
+        } else {
+            // pull this out so that LLVM can optimize the match better
+            if s.len() > MAX_SIZE {
+                return None;
+            }
+            last_char = LastUtf8Char::from_len(s.len());
+            short_buf[..s.len()].copy_from_slice(&s.as_bytes());
+        }
+        Some(InlineBuffer {
+            buf: short_buf, last_char
+        })
     }
 
     #[inline]
@@ -47,30 +40,30 @@ impl InlineBuffer {
         if text.len() > MAX_SIZE {
             panic!("Provided string has a length greater than our MAX_SIZE");
         }
-
-        let len = text.len();
-        let mut buffer = [0u8; MAX_SIZE];
-
-        // set the length
-        buffer[MAX_SIZE - 1] = len as u8 | LENGTH_MASK;
-
-        // Note: for loops aren't allowed in `const fn`, hence the while.
-        // Note: Iterating forward results in badly optimized code, because the compiler tries to
-        //       unroll the loop.
-        let text = text.as_bytes();
-        let mut i = len;
-        while i > 0 {
-            buffer[i - 1] = text[i - 1];
-            i -= 1;
+        let mut short_buf = [0u8; MAX_SIZE - 1];
+        let last_char;
+        if text.len() == MAX_SIZE {
+            short_buf[..MAX_SIZE - 1].copy_from_slice(&text.as_bytes()[..MAX_SIZE - 1]);
+            last_char = LastUtf8Char::from_utf8_byte(text.as_bytes()[MAX_SIZE - 1]);
+        } else {
+            last_char = LastUtf8Char::from_len(text.len());
+            short_buf[..text.len()].copy_from_slice(&text.as_bytes());
         }
-
-        InlineBuffer(buffer)
+        InlineBuffer {
+            buf: short_buf, last_char
+        }
     }
 
     /// Returns an empty [`InlineBuffer`]
     #[inline(always)]
     pub const fn empty() -> Self {
-        Self::new_const("")
+        const EMPTY: InlineBuffer = InlineBuffer::new_const("");
+        EMPTY
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.last_char.as_len()
     }
 
     /// Consumes the [`InlineBuffer`] returning the entire underlying array and the length of the
@@ -78,27 +71,13 @@ impl InlineBuffer {
     #[inline]
     #[cfg(feature = "smallvec")]
     pub fn into_array(self) -> ([u8; MAX_SIZE], usize) {
-        let mut buffer = self.0;
-
-        let length = core::cmp::min(
-            (buffer[MAX_SIZE - 1].wrapping_sub(LENGTH_MASK)) as usize,
-            MAX_SIZE,
-        );
-
-        let last_byte_ref = &mut buffer[MAX_SIZE - 1];
-
-        // unset the last byte of the buffer if it's just storing the length of the string
-        //
-        // Note: we should never add an `else` statement here, keeping the conditional simple allows
-        // the compiler to optimize this to a conditional-move instead of a branch
-        if length < MAX_SIZE {
-            *last_byte_ref = 0;
-        }
-
-        (buffer, length)
+        let mut buffer = [0; MAX_SIZE];
+        buffer[..MAX_SIZE - 1].copy_from_slice(&self.buf);
+        buffer[MAX_SIZE - 1] = self.last_char as u8;
+        (buffer, self.len())
     }
 
-    /// Set's the length of the content for this [`InlineBuffer`]
+    /// Sets the length of the content for this [`InlineBuffer`]
     ///
     /// # SAFETY:
     /// * The caller must guarantee that `len` bytes in the buffer are valid UTF-8
@@ -110,8 +89,13 @@ impl InlineBuffer {
         // can infer this because the way we encode length doesn't overlap with any valid UTF-8
         // bytes
         if len < MAX_SIZE {
-            self.0[MAX_SIZE - 1] = len as u8 | LENGTH_MASK;
+            self.last_char = LastUtf8Char::from_len(len);
         }
+    }
+
+    pub(crate) unsafe fn as_mut_buf(&mut self) -> &mut [MaybeUninit<u8>] {
+        // SAFETY: the caller must guarantee that they only write valid UTF-8 last-bytes into `last_char`
+        slice::from_raw_parts_mut(self as *mut Self as *mut MaybeUninit<u8>, MAX_SIZE)
     }
 }
 
@@ -151,10 +135,7 @@ mod tests {
 
         use quickcheck_macros::quickcheck;
 
-        use crate::repr::{
-            InlineBuffer,
-            MAX_SIZE,
-        };
+        use crate::repr::{InlineBuffer, MAX_SIZE};
 
         #[test]
         fn test_into_array() {
