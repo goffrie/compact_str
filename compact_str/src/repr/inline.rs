@@ -2,14 +2,15 @@ use core::mem::MaybeUninit;
 use core::{ptr, slice};
 
 use super::last_utf8_char::LastUtf8Char;
-use super::{Repr, LENGTH_MASK, MAX_SIZE};
+use super::{Repr, MAX_SIZE};
 
 /// A buffer stored on the stack whose size is equal to the stack size of `String`
 #[repr(C)]
 pub(crate) struct InlineBuffer {
     buf: [u8; MAX_SIZE - 1],
-    last_char: LastUtf8Char
+    last_char: LastUtf8Char,
 }
+static_assertions::assert_eq_size!([u8; MAX_SIZE], InlineBuffer);
 
 impl InlineBuffer {
     /// Construct a new [`InlineString`]. A string that lives in a small buffer on the stack
@@ -27,11 +28,12 @@ impl InlineBuffer {
             if s.len() > MAX_SIZE {
                 return None;
             }
-            last_char = LastUtf8Char::from_len(s.len());
             short_buf[..s.len()].copy_from_slice(&s.as_bytes());
+            last_char = LastUtf8Char::from_len(s.len());
         }
         Some(InlineBuffer {
-            buf: short_buf, last_char
+            buf: short_buf,
+            last_char,
         })
     }
 
@@ -42,15 +44,23 @@ impl InlineBuffer {
         }
         let mut short_buf = [0u8; MAX_SIZE - 1];
         let last_char;
+        let copy_len;
         if text.len() == MAX_SIZE {
-            short_buf[..MAX_SIZE - 1].copy_from_slice(&text.as_bytes()[..MAX_SIZE - 1]);
             last_char = LastUtf8Char::from_utf8_byte(text.as_bytes()[MAX_SIZE - 1]);
+            copy_len = MAX_SIZE - 1;
         } else {
             last_char = LastUtf8Char::from_len(text.len());
-            short_buf[..text.len()].copy_from_slice(&text.as_bytes());
+            copy_len = text.len();
+        }
+        // Copy using a loop since this is a const fn
+        let mut i = 0;
+        while i < copy_len {
+            short_buf[i] = text.as_bytes()[i];
+            i += 1;
         }
         InlineBuffer {
-            buf: short_buf, last_char
+            buf: short_buf,
+            last_char,
         }
     }
 
@@ -93,9 +103,17 @@ impl InlineBuffer {
         }
     }
 
-    pub(crate) unsafe fn as_mut_buf(&mut self) -> &mut [MaybeUninit<u8>] {
-        // SAFETY: the caller must guarantee that they only write valid UTF-8 last-bytes into `last_char`
-        slice::from_raw_parts_mut(self as *mut Self as *mut MaybeUninit<u8>, MAX_SIZE)
+    /// # SAFETY:
+    /// * The caller must guarantee that they only write valid UTF-8 into the buffer
+    pub(crate) unsafe fn as_mut_buf(&mut self) -> &mut [u8] {
+        // SAFETY: size_of::<Self>() == MAX_SIZE
+        slice::from_raw_parts_mut(self as *mut Self as *mut u8, MAX_SIZE)
+    }
+
+    // N.B.: Only the first `self.len()` bytes are guaranteed to be valid UTF-8, but all bytes are initialized
+    pub(crate) fn as_buf(&self) -> &[u8] {
+        // SAFETY: size_of::<Self>() == MAX_SIZE, and Self contains no uninitialized bytes
+        unsafe { slice::from_raw_parts(self as *const Self as *const u8, MAX_SIZE) }
     }
 }
 

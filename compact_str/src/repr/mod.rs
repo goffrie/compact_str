@@ -12,29 +12,29 @@ mod bytes;
 #[cfg(feature = "smallvec")]
 mod smallvec;
 
-mod capacity;
+//mod capacity;
 mod heap;
 mod inline;
 mod iter;
 mod last_utf8_char;
 mod num;
-mod static_str;
+//mod static_str;
 mod traits;
 
 use alloc::string::String;
 
-use self::capacity::Capacity;
-use self::heap::{HeapBuffer, ThinHeapBuffer};
+// use self::capacity::Capacity;
+use self::heap::{HeapBuffer, ThinHeapBuffer, TooLong};
 use self::inline::InlineBuffer;
 use self::last_utf8_char::LastUtf8Char;
-pub use traits::IntoRepr;
+pub(crate) use traits::IntoRepr;
 
 /// The max size of a string we can fit inline
 pub const MAX_SIZE: usize = core::mem::size_of::<String>();
 
 const EMPTY: Repr = Repr::new_inline("");
 
-pub enum Repr {
+pub(crate) enum Repr {
     Inline(InlineBuffer),
     Heap(HeapBuffer),
     ThinHeap(ThinHeapBuffer),
@@ -142,7 +142,7 @@ impl Repr {
     /// `String`.
     #[inline]
     pub fn from_string(s: String, should_inline: bool) -> Self {
-        if should_inline {
+        if should_inline || s.capacity() == 0 {
             if let Some(inline) = InlineBuffer::new(&s) {
                 return Repr::Inline(inline);
             }
@@ -284,26 +284,12 @@ impl Repr {
     /// Returns the string content, and only the string content, as a slice of bytes.
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        // initially has the value of the stack pointer, conditionally becomes the heap pointer
-        let mut pointer = self as *const Self as *const u8;
-        let heap_pointer = self.0 as *const u8;
-        if self.last_byte() >= HEAP_MASK {
-            pointer = heap_pointer;
+        match self {
+            Repr::Inline(inline) => &inline.as_buf()[..inline.len()],
+            Repr::Heap(heap) => heap.as_slice(),
+            Repr::ThinHeap(thin_heap) => thin_heap.as_slice(),
+            Repr::Static(s) => s.as_bytes(),
         }
-
-        // initially has the value of the stack length, conditionally becomes the heap length
-        let mut length = core::cmp::min(
-            self.last_byte().wrapping_sub(LENGTH_MASK) as usize,
-            MAX_SIZE,
-        );
-        let heap_length = self.1;
-        if self.last_byte() >= HEAP_MASK {
-            length = heap_length;
-        }
-
-        // SAFETY: We know the data is valid, aligned, and part of the same contiguous allocated
-        // chunk. It's also valid for the lifetime of self
-        unsafe { core::slice::from_raw_parts(pointer, length) }
     }
 
     #[inline]
@@ -316,101 +302,43 @@ impl Repr {
     #[allow(clippy::len_without_is_empty)] // is_empty exists on CompactString
     #[inline]
     pub fn len(&self) -> usize {
-        // This ugly looking code results in two conditional moves and only one comparison, without
-        // branching. The outcome of a comparison is a tristate `{lt, eq, gt}`, but the compiler
-        // won't use this optimization if you match on `len_inline.cmp(&MAX_SIZE)`, so we have to
-        // do it manually.
-
-        // Force the compiler to read the variable, so it won't put the reading in a branch.
-        let len_heap = self.1;
-        // SAFETY: This assembly instruction is a noop that only affects the instruction ordering.
-        #[cfg(all(
-            not(miri),
-            any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_arch = "arm",
-                target_arch = "aarch64",
-                target_arch = "loongarch",
-                target_arch = "riscv",
-            )
-        ))]
-        unsafe {
-            core::arch::asm!(
-                "/* {len_heap} */",
-                len_heap = in(reg) len_heap,
-                options(nomem, nostack),
-            );
-        };
-
-        let last_byte = self.last_byte();
-
-        // Extending the variable early results in fewer instructions, because loading and
-        // extending can be done in one instruction.
-        let mut len = (last_byte as usize)
-            .wrapping_sub(LENGTH_MASK as usize)
-            .min(MAX_SIZE);
-
-        // our discriminant is stored in the last byte and denotes stack vs heap
-        //
-        // Note: We should never add an `else` statement here, keeping the conditional simple allows
-        // the compiler to optimize this to a conditional-move instead of a branch
-        if last_byte >= HEAP_MASK {
-            len = len_heap;
+        match self {
+            Repr::Inline(inline) => inline.len(),
+            Repr::Heap(heap) => heap.len(),
+            Repr::ThinHeap(thin_heap) => thin_heap.len(),
+            Repr::Static(s) => s.len(),
         }
-
-        len
     }
 
     /// Returns the overall capacity of the underlying buffer
     #[inline]
     pub fn capacity(&self) -> usize {
-        #[cold]
-        fn heap_capacity(this: &Repr) -> usize {
-            // SAFETY: We just checked the discriminant to make sure we're heap allocated
-            let heap_buffer = unsafe { this.as_heap() };
-            heap_buffer.capacity()
-        }
-
-        if let Some(s) = self.as_static_str() {
-            s.len()
-        } else if self.is_heap_allocated() {
-            heap_capacity(self)
-        } else {
-            MAX_SIZE
+        match self {
+            Repr::Inline(_) => MAX_SIZE,
+            Repr::Heap(heap) => heap.capacity(),
+            Repr::ThinHeap(thin_heap) => thin_heap.capacity(),
+            Repr::Static(s) => s.len(),
         }
     }
 
     #[inline(always)]
     pub fn is_heap_allocated(&self) -> bool {
-        let last_byte = self.last_byte();
-        last_byte == HEAP_MASK
+        match self {
+            Repr::Inline(_) | Repr::Static(_) => false,
+            Repr::Heap(_) | Repr::ThinHeap(_) => true,
+        }
     }
 
     #[inline(always)]
     const fn is_static_str(&self) -> bool {
-        let last_byte = self.last_byte();
-        last_byte == STATIC_STR_MASK
+        matches!(self, Repr::Static(_))
     }
 
     #[inline]
     #[rustversion::attr(since(1.64), const)]
     pub fn as_static_str(&self) -> Option<&'static str> {
-        if self.is_static_str() {
-            // SAFETY: A `Repr` is transmuted from `StaticStr`
-            let s: &StaticStr = unsafe { &*(self as *const Self as *const StaticStr) };
-            Some(s.get_text())
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn as_static_variant_mut(&mut self) -> Option<&mut StaticStr> {
-        if self.is_static_str() {
-            // SAFETY: A `Repr` is transmuted from `StaticStr`
-            let s: &mut StaticStr = unsafe { &mut *(self as *mut Self as *mut StaticStr) };
-            Some(s)
+        if let Repr::Static(s) = self {
+            Some(*s)
         } else {
             None
         }
@@ -429,7 +357,11 @@ impl Repr {
 
         match self {
             Repr::Static(_) => unreachable!(),
-            Repr::Inline(inline) => inline.as_mut_buf(),
+            Repr::Inline(inline) => {
+                // SAFETY: [u8] and [MaybeUninit<u8>] have the same layout,
+                // and the caller promises not to write uninitialized bytes
+                mem::transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(inline.as_mut_buf())
+            },
             Repr::Heap(heap) => heap.as_mut_buf(),
             Repr::ThinHeap(thin_heap) => thin_heap.as_mut_buf(),
         }
@@ -441,135 +373,14 @@ impl Repr {
     /// * `len` bytes in the buffer must be valid UTF-8
     /// * If the underlying buffer is stored inline, `len` must be <= MAX_SIZE
     pub unsafe fn set_len(&mut self, len: usize) {
-        if let Some(s) = self.as_static_variant_mut() {
-            s.set_len(len);
-        } else if self.is_heap_allocated() {
-            // SAFETY: We just checked the discriminant to make sure we're heap allocated
-            let heap_buffer = self.as_mut_heap();
-            // SAFETY: The caller guarantees that `len` bytes is valid UTF-8
-            heap_buffer.set_len(len);
-        } else {
-            // SAFETY: We just checked the discriminant to make sure we're an InlineBuffer
-            let inline_buffer = self.as_mut_inline();
-            // SAFETY: The caller guarantees that len <= MAX_SIZE, and `len` bytes is valid UTF-8
-            inline_buffer.set_len(len);
-        }
-    }
-
-    /// Returns the last byte that's on the stack.
-    ///
-    /// The last byte stores the discriminant that indicates whether the string is on the stack or
-    /// on the heap. When the string is on the stack the last byte also stores the length
-    #[inline(always)]
-    const fn last_byte(&self) -> u8 {
-        cfg_if::cfg_if! {
-            if #[cfg(target_pointer_width = "64")] {
-                let last_byte = self.5;
-            } else if #[cfg(target_pointer_width = "32")] {
-                let last_byte = self.4;
-            } else {
-                compile_error!("Unsupported target_pointer_width");
+        match self {
+            Repr::Static(s) => {
+                *s = &s[..len];
             }
-        };
-        last_byte as u8
-    }
-
-    /// Reinterprets an [`InlineBuffer`] into a [`Repr`]
-    ///
-    /// Note: This is safe because [`InlineBuffer`] and [`Repr`] are the same size. We used to
-    /// define [`Repr`] as a `union` which implicitly transmuted between the two types, but that
-    /// prevented us from defining a "niche" value to make `Option<CompactString>` the same size as
-    /// just `CompactString`
-    #[inline(always)]
-    const fn from_inline(inline: InlineBuffer) -> Self {
-        // SAFETY: An `InlineBuffer` and `Repr` have the same size
-        unsafe { core::mem::transmute(inline) }
-    }
-
-    /// Reinterprets a [`HeapBuffer`] into a [`Repr`]
-    ///
-    /// Note: This is safe because [`HeapBuffer`] and [`Repr`] are the same size. We used to define
-    /// [`Repr`] as a `union` which implicitly transmuted between the two types, but that prevented
-    /// us from defining a "niche" value to make `Option<CompactString>` the same size as just
-    /// `CompactString`
-    #[inline(always)]
-    const fn from_heap(heap: HeapBuffer) -> Self {
-        // SAFETY: A `HeapBuffer` and `Repr` have the same size
-        unsafe { core::mem::transmute(heap) }
-    }
-
-    /// Reinterprets a [`Repr`] as a [`HeapBuffer`]
-    ///
-    /// # SAFETY
-    /// * The caller must guarantee that the provided [`Repr`] is actually a [`HeapBuffer`] by
-    /// checking the discriminant
-    ///
-    /// Note: We used to define [`Repr`] as a `union` which implicitly transmuted between the two
-    /// types, but that prevented us from defining a "niche" value to make `Option<CompactString>`
-    /// the same size as just `CompactString`
-    #[inline(always)]
-    const unsafe fn into_heap(self) -> HeapBuffer {
-        core::mem::transmute(self)
-    }
-
-    /// Reinterprets a `&mut Repr` as a `&mut HeapBuffer`
-    ///
-    /// # SAFETY
-    /// * The caller must guarantee that the provided [`Repr`] is actually a [`HeapBuffer`] by
-    /// checking the discriminant
-    ///
-    /// Note: We used to define [`Repr`] as a `union` which implicitly transmuted between the two
-    /// types, but that prevented us from defining a "niche" value to make `Option<CompactString>`
-    /// the same size as just `CompactString`
-    #[inline(always)]
-    unsafe fn as_mut_heap(&mut self) -> &mut HeapBuffer {
-        // SAFETY: A `HeapBuffer` and `Repr` have the same size
-        &mut *(self as *mut _ as *mut HeapBuffer)
-    }
-
-    /// Reinterprets a `&Repr` as a `&HeapBuffer`
-    ///
-    /// # SAFETY
-    /// * The caller must guarantee that the provided [`Repr`] is actually a [`HeapBuffer`] by
-    /// checking the discriminant
-    ///
-    /// Note: We used to define [`Repr`] as a `union` which implicitly transmuted between the two
-    /// types, but that prevented us from defining a "niche" value to make `Option<CompactString>`
-    /// the same size as just `CompactString`
-    #[inline(always)]
-    unsafe fn as_heap(&self) -> &HeapBuffer {
-        // SAFETY: A `HeapBuffer` and `Repr` have the same size
-        &*(self as *const _ as *const HeapBuffer)
-    }
-
-    /// Reinterprets a [`Repr`] as an [`InlineBuffer`]
-    ///
-    /// # SAFETY
-    /// * The caller must guarantee that the provided [`Repr`] is actually an [`InlineBuffer`] by
-    /// checking the discriminant
-    ///
-    /// Note: We used to define [`Repr`] as a `union` which implicitly transmuted between the two
-    /// types, but that prevented us from defining a "niche" value to make `Option<CompactString>`
-    /// the same size as just `CompactString`
-    #[inline(always)]
-    #[cfg(feature = "smallvec")]
-    const unsafe fn into_inline(self) -> InlineBuffer {
-        core::mem::transmute(self)
-    }
-
-    /// Reinterprets a `&mut Repr` as an `&mut InlineBuffer`
-    ///
-    /// # SAFETY
-    /// * The caller must guarantee that the provided [`Repr`] is actually an [`InlineBuffer`] by
-    /// checking the discriminant
-    ///
-    /// Note: We used to define [`Repr`] as a `union` which implicitly transmuted between the two
-    /// types, but that prevented us from defining a "niche" value to make `Option<CompactString>`
-    /// the same size as just `CompactString`
-    #[inline(always)]
-    unsafe fn as_mut_inline(&mut self) -> &mut InlineBuffer {
-        // SAFETY: An `InlineBuffer` and `Repr` have the same size
-        &mut *(self as *mut _ as *mut InlineBuffer)
+            Repr::Inline(inline) => inline.set_len(len),
+            Repr::Heap(heap) => heap.set_len(len),
+            Repr::ThinHeap(thin_heap) => thin_heap.set_len(len),
+        }
     }
 }
 
@@ -590,24 +401,6 @@ impl Clone for Repr {
             // SAFETY: We just checked that `self` can be copied because it is an inline string or
             // a reference to a `&'static str`.
             unsafe { core::ptr::read(self) }
-        }
-    }
-}
-
-impl Drop for Repr {
-    #[inline]
-    fn drop(&mut self) {
-        // By "outlining" the actual Drop code and only calling it if we're a heap variant, it
-        // allows dropping an inline variant to be as cheap as possible.
-        if self.is_heap_allocated() {
-            outlined_drop(self)
-        }
-
-        #[cold]
-        fn outlined_drop(this: &mut Repr) {
-            // SAFETY: We just checked the discriminant to make sure we're heap allocated
-            let heap_buffer = unsafe { this.as_mut_heap() };
-            heap_buffer.dealloc();
         }
     }
 }

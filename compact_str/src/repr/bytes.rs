@@ -1,11 +1,11 @@
-use core::str::Utf8Error;
+use core::{
+    mem::{self, MaybeUninit},
+    str::Utf8Error,
+};
 
 use bytes::Buf;
 
-use super::{
-    Repr,
-    MAX_SIZE,
-};
+use super::{Repr, MAX_SIZE};
 
 impl Repr {
     /// Converts a [`Buf`] of bytes to a [`Repr`], checking that the provided bytes are valid UTF-8
@@ -48,6 +48,7 @@ impl Repr {
             // invalid UTF-8, but would result in us creating an inline variant, that identifies as
             // a heap variant. If a user ever tried to reference the data at all, we'd incorrectly
             // try and read data from an invalid memory address, causing undefined behavior.
+            // XXX: test this
             if bytes_written < MAX_SIZE && bytes_written + chunk_len == MAX_SIZE {
                 let last_byte = chunk[chunk_len - 1];
                 // If we hit the edge case, reserve additional space to make the repr becomes heap
@@ -64,7 +65,9 @@ impl Repr {
             // invariant is documented in the public API
             let slice = repr.as_mut_buf();
             // write the chunk into the Repr
-            slice[bytes_written..bytes_written + chunk_len].copy_from_slice(chunk);
+            // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout
+            slice[bytes_written..bytes_written + chunk_len]
+                .copy_from_slice(unsafe { mem::transmute::<&[u8], &[MaybeUninit<u8>]>(chunk) });
 
             // Set the length of the Repr
             // SAFETY: We just wrote an additional `chunk_len` bytes into the Repr

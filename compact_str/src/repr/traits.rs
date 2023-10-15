@@ -4,7 +4,7 @@ const FALSE: Repr = Repr::new_inline("false");
 const TRUE: Repr = Repr::new_inline("true");
 
 /// Defines how to _efficiently_ create a [`Repr`] from `self`
-pub trait IntoRepr {
+pub(crate) trait IntoRepr {
     fn into_repr(self) -> Repr;
 }
 

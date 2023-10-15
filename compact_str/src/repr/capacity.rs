@@ -5,20 +5,6 @@ use crate::repr::LastUtf8Char;
 // how many bytes a `usize` occupies
 const USIZE_SIZE: usize = core::mem::size_of::<usize>();
 
-/// Mask of bits in [`Capacity`] that encode the value.
-const VALID_MASK: usize = {
-    let mut bytes = [255; USIZE_SIZE];
-    bytes[USIZE_SIZE - 1] = 0;
-    usize::from_ne_bytes(bytes)
-};
-
-/// Mask of bits that are set in [`Capacity`] if the string data is stored on the heap.
-const HEAP_MARKER: usize = {
-    let mut bytes = [0; USIZE_SIZE];
-    bytes[USIZE_SIZE - 1] = LastUtf8Char::Heap as u8;
-    usize::from_ne_bytes(bytes)
-};
-
 /// State that describes the capacity as being stored on the heap.
 ///
 /// All bytes `255`, with the last being [`LastUtf8Char::Heap`], using the same amount of bytes

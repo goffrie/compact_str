@@ -8,6 +8,7 @@ use core::{
     num,
     ptr,
 };
+use core::mem::MaybeUninit;
 
 use super::traits::IntoRepr;
 use super::Repr;
@@ -59,9 +60,13 @@ macro_rules! impl_IntoRepr {
                             let d1 = (rem / 100) << 1;
                             let d2 = (rem % 100) << 1;
                             curr -= 4;
-                            ptr::copy_nonoverlapping(lut_ptr.offset(d1), buf_ptr.offset(curr), 2);
                             ptr::copy_nonoverlapping(
-                                lut_ptr.offset(d2),
+                                lut_ptr.offset(d1).cast::<MaybeUninit<u8>>(),
+                                buf_ptr.offset(curr),
+                                2,
+                            );
+                            ptr::copy_nonoverlapping(
+                                lut_ptr.offset(d2).cast::<MaybeUninit<u8>>(),
                                 buf_ptr.offset(curr + 2),
                                 2,
                             );
@@ -76,22 +81,30 @@ macro_rules! impl_IntoRepr {
                         let d1 = (n % 100) << 1;
                         n /= 100;
                         curr -= 2;
-                        ptr::copy_nonoverlapping(lut_ptr.offset(d1), buf_ptr.offset(curr), 2);
+                        ptr::copy_nonoverlapping(
+                            lut_ptr.offset(d1).cast::<MaybeUninit<u8>>(),
+                            buf_ptr.offset(curr),
+                            2,
+                        );
                     }
 
                     // decode last 1 or 2 chars
                     if n < 10 {
                         curr -= 1;
-                        *buf_ptr.offset(curr) = (n as u8) + b'0';
+                        *buf_ptr.offset(curr) = MaybeUninit::new((n as u8) + b'0');
                     } else {
                         let d1 = n << 1;
                         curr -= 2;
-                        ptr::copy_nonoverlapping(lut_ptr.offset(d1), buf_ptr.offset(curr), 2);
+                        ptr::copy_nonoverlapping(
+                            lut_ptr.offset(d1).cast::<MaybeUninit<u8>>(),
+                            buf_ptr.offset(curr),
+                            2,
+                        );
                     }
 
                     if !is_nonnegative {
                         curr -= 1;
-                        *buf_ptr.offset(curr) = b'-';
+                        *buf_ptr.offset(curr) = MaybeUninit::new(b'-');
                     }
                 }
 

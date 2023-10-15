@@ -14,36 +14,14 @@ use alloc::boxed::Box;
 use alloc::string::String;
 #[doc(hidden)]
 pub use core;
-use core::borrow::{
-    Borrow,
-    BorrowMut,
-};
+use core::borrow::{Borrow, BorrowMut};
 use core::cmp::Ordering;
-use core::hash::{
-    Hash,
-    Hasher,
-};
-use core::iter::{
-    FromIterator,
-    FusedIterator,
-};
-use core::ops::{
-    Add,
-    AddAssign,
-    Bound,
-    Deref,
-    DerefMut,
-    RangeBounds,
-};
-use core::str::{
-    FromStr,
-    Utf8Error,
-};
-use core::{
-    fmt,
-    mem,
-    slice,
-};
+use core::hash::{Hash, Hasher};
+use core::iter::{FromIterator, FusedIterator};
+use core::mem::MaybeUninit;
+use core::ops::{Add, AddAssign, Bound, Deref, DerefMut, RangeBounds};
+use core::str::{FromStr, Utf8Error};
+use core::{fmt, mem, slice};
 #[cfg(feature = "std")]
 use std::ffi::OsStr;
 
@@ -55,10 +33,7 @@ mod repr;
 use repr::Repr;
 
 mod traits;
-pub use traits::{
-    CompactStringExt,
-    ToCompactString,
-};
+pub use traits::{CompactStringExt, ToCompactString};
 
 #[cfg(test)]
 mod tests;
@@ -567,7 +542,10 @@ impl CompactString {
     #[inline]
     pub fn as_mut_str(&mut self) -> &mut str {
         let len = self.len();
-        unsafe { core::str::from_utf8_unchecked_mut(&mut self.0.as_mut_buf()[..len]) }
+        unsafe {
+            let slice: &mut [MaybeUninit<u8>] = &mut self.0.as_mut_buf()[..len];
+            core::str::from_utf8_unchecked_mut(&mut *(slice as *mut [_] as *mut [u8]))
+        }
     }
 
     unsafe fn spare_capacity_mut(&mut self) -> &mut [mem::MaybeUninit<u8>] {
@@ -617,7 +595,9 @@ impl CompactString {
     /// ```
     #[inline]
     pub unsafe fn as_mut_bytes(&mut self) -> &mut [u8] {
-        self.0.as_mut_buf()
+        // TODO: is this safe?
+        let slice: &mut [MaybeUninit<u8>] = &mut self.0.as_mut_buf();
+        &mut *(slice as *mut [_] as *mut [u8])
     }
 
     /// Appends the given [`char`] to the end of this [`CompactString`].
@@ -977,7 +957,7 @@ impl CompactString {
     /// Converts a mutable [`CompactString`] to a raw pointer.
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        unsafe { self.0.as_mut_buf().as_mut_ptr() }
+        unsafe { self.0.as_mut_buf().as_mut_ptr().cast() }
     }
 
     /// Insert string character at an index.

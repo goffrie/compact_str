@@ -37,7 +37,7 @@ impl FromIterator<char> for Repr {
                 // push existing characters onto the heap
                 // SAFETY: `inline_buf` has been filled with `char`s which are valid UTF-8
                 string
-                    .push_str(unsafe { core::str::from_utf8_unchecked(&inline_buf.0[..curr_len]) });
+                    .push_str(unsafe { core::str::from_utf8_unchecked(&inline_buf.as_buf()[..curr_len]) });
                 // push current char onto the heap
                 string.push(c);
                 // extend heap with remaining characters
@@ -47,14 +47,15 @@ impl FromIterator<char> for Repr {
             }
 
             // write the current char into a slice of the unoccupied space
-            c.encode_utf8(&mut inline_buf.0[curr_len..]);
+            // SAFETY: `char::encode_utf8` only writes valid UTF-8, so we cannot corrupt `inline_buf.last_char`
+            c.encode_utf8(unsafe { &mut inline_buf.as_mut_buf()[curr_len..] });
             curr_len += char_len;
         }
 
         // SAFETY: Everything we just pushed onto the buffer is a `str` which is valid UTF-8
         unsafe { inline_buf.set_len(curr_len) }
 
-        Repr::from_inline(inline_buf)
+        Repr::Inline(inline_buf)
     }
 }
 
@@ -89,7 +90,7 @@ where
 
             // push existing strings onto the heap
             // SAFETY: `inline_buf` has been filled with `&str`s which are valid UTF-8
-            string.push_str(unsafe { core::str::from_utf8_unchecked(&inline_buf.0[..curr_len]) });
+            string.push_str(unsafe { core::str::from_utf8_unchecked(&inline_buf.as_buf()[..curr_len]) });
             // push current string onto the heap
             string.push_str(str_slice);
             // extend heap with remaining strings
@@ -99,14 +100,15 @@ where
         }
 
         // write the current string into a slice of the unoccupied space
-        inline_buf.0[curr_len..][..bytes_len].copy_from_slice(str_slice.as_bytes());
+        // SAFETY: `str_slice` is a `&str` and therefore must contain valid UTF-8
+        unsafe { inline_buf.as_mut_buf()[curr_len..][..bytes_len].copy_from_slice(str_slice.as_bytes()) };
         curr_len += bytes_len;
     }
 
     // SAFETY: Everything we just pushed onto the buffer is a `str` which is valid UTF-8
     unsafe { inline_buf.set_len(curr_len) }
 
-    Repr::from_inline(inline_buf)
+    Repr::Inline(inline_buf)
 }
 
 impl<'a> FromIterator<&'a str> for Repr {
